@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>   // usleep
+#include "fetch_links.h"
 
 // ---- Person 1's function (match the name/signature they actually write) ----
 std::vector<std::string> get_links(const std::string& url);
