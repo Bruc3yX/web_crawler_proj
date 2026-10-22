@@ -352,15 +352,24 @@ vector<string> get_links(const string& start_url) {
 	try {
 		for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
 			Url u;
-			if (!parse_url(url, u)) return {};
+			if (!parse_url(url, u)) {
+				cerr << "[get_links] not a valid http(s) URL: " << url << "\n";
+				return {};
+			}
 			auto res = fetch(u);
 			unsigned code = res.result_int();
 
 			if (code >= 300 && code < 400) {                 // 301/302/307/308...: go where Location says
 				auto it = res.find(http::field::location);
-				if (it == res.end()) return {};
+				if (it == res.end()) {
+					cerr << "[get_links] HTTP " << code << " redirect with no Location: " << url << "\n";
+					return {};
+				}
 				url = resolve(u, string(it->value()));  // Location may be relative
-				if (url.empty()) return {};
+				if (url.empty()) {
+					cerr << "[get_links] unusable redirect target from HTTP " << code << "\n";
+					return {};
+				}
 				continue;                                    // loop again with the new URL
 			}
 			if (code != 200) {
@@ -368,9 +377,15 @@ vector<string> get_links(const string& start_url) {
 				return {};
 			}
 			auto ct = res.find(http::field::content_type);
-			if (ct != res.end() && lower(string(ct->value())).find("html") == string::npos)
+			if (ct != res.end() && lower(string(ct->value())).find("html") == string::npos) {
+				cerr << "[get_links] skipping non-HTML (" << string(ct->value()) << "): " << url << "\n";
 				return {};                                   // not a web page (pdf, image, ...)
-			return extract_links(res.body(), u);             // u = FINAL url, so relative links resolve right
+			}
+			auto links = extract_links(res.body(), u);       // u = FINAL url, so relative links resolve right
+			if (links.empty())
+				cerr << "[get_links] HTTP 200 but no links found (" << res.body().size()
+				     << " bytes) at " << url << "\n";
+			return links;
 		}
 		cerr << "[get_links] too many redirects: " << start_url << "\n";
 	} catch (const exception& e) {
