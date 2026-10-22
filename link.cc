@@ -1,23 +1,19 @@
-// link.cc  --  Step 1 (Person 1): download a web page and return the links on it.
-//
-// PUBLIC API (declared in fetch_links.h):
-//     vector<string> get_links(const string& url);
-//   -> absolute, de-duplicated http(s) URLs found in <a href="..."> tags.
-//   -> returns an EMPTY vector on any failure (bad URL, timeout, 404, not HTML...).
-//      It never throws, so the crawler can call it blindly.
-//
-// HOW IT WORKS (top to bottom of this file)
-//   1. parse_url()     split "https://host:port/path?x" into scheme/host/port/target
-//   2. resolve()       turn any href ("/a", "../b", "//cdn.x.com/c") into an absolute URL
-//   3. fetch()         ONE HTTP(S) GET using Boost.Beast (tcp_stream / ssl_stream),
-//                      with a timeout on every network step
-//   4. extract_links() use readlib's readline(page, '<') to chop the HTML into
-//                      one chunk per tag, keep the <a ...> ones, pull out href=
-//   5. get_links()     glue: fetch -> follow redirects -> check it's HTML -> extract
-//
-// BUILD (needs: sudo apt install libboost-dev libssl-dev), read.h in same folder:
-//     g++ -std=c++17 -O2 main.cc link.cc -o crawler -lssl -lcrypto -pthread
+/*
+ The public API is declared in fetch_links.h:
+    vector<string> get_links(const string& url);
+    absolute, de-duplicated http(s) URLs found in <a href="..."> tags.
+    returns an EMPTY vector on any failure (bad URL, timeout, 404, not HTML...).
+    It never throws, so the crawler can call it blindly.
 
+The flow for how everything works:
+   1. parse_url()     split "https://host:port/path?x" into scheme/host/port/target
+   2. resolve()       turn any href ("/a", "../b", "//cdn.x.com/c") into an absolute URL
+   3. fetch()         ONE HTTP(S) GET using Boost.Beast (tcp_stream / ssl_stream),
+                      with a timeout on every network step
+   4. extract_links() use readlib's readline(page, '<') to chop the HTML into
+                      one chunk per tag, keep the <a ...> ones, pull out href=
+   5. get_links()     glue: fetch -> follow redirects -> check it's HTML -> extract
+*/
 #include "fetch_links.h"
 #include "read.h"          // ShakaUVM readlib: readline(stream, delimiter)
 
@@ -38,22 +34,17 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
-
-using namespace std;          // so we can write string, vector, cerr... without std::
-
+using namespace std;
 namespace beast = boost::beast;
 namespace http  = beast::http;
 namespace net   = boost::asio;
 namespace ssl   = net::ssl;
 using tcp = net::ip::tcp;
-
 namespace {
-
 const char* USER_AGENT = "Mozilla/5.0 (compatible; ClassProjectCrawler/1.0; student project)";
 const int MAX_REDIRECTS = 5;                         // give up after this many 3xx hops
 const size_t MAX_BODY = 8 * 1024 * 1024;        // refuse pages bigger than 8 MB
 const auto TIMEOUT = chrono::seconds(15);       // per network step (connect/handshake/send/receive)
-
 string lower(string s) {
 	transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
 		return tolower(c);
@@ -61,15 +52,11 @@ string lower(string s) {
 	return s;
 }
 
-// ===========================================================================
-// 1. URL parsing
-// ===========================================================================
-
+//URL parsing
 struct Url {
 	string scheme, host, port, target;   // target = path + ?query (always starts with '/')
 };
 
-// "https://Example.com:8080/a/b?x=1#frag" -> scheme=https host=example.com port=8080 target=/a/b?x=1
 bool parse_url(const string& s, Url& u) {
 	size_t p = s.find("://");
 	if (p == string::npos) return false;
@@ -95,11 +82,8 @@ bool parse_url(const string& s, Url& u) {
 	return !u.host.empty();
 }
 
-// ===========================================================================
-// 2. Making links absolute
-// ===========================================================================
-
-// Collapse "." and ".." segments, keeping any ?query.  "/a/b/../c" -> "/a/c"
+// Making links absolute
+// Collapse "." and ".." segments, keeping any ?query.
 string remove_dots(const string& in) {
 	size_t q = in.find('?');
 	string path = in.substr(0, q);
@@ -176,9 +160,8 @@ string resolve(const Url& base, string href) {
 	return origin + remove_dots(dir + href);                             // "page2.html", "../x"
 }
 
-// ===========================================================================
-// 3. HTTP(S) download with Boost.Beast
-// ===========================================================================
+// HTTP(S) download with Boost.Beast
+
 // NOTE ON TIMEOUTS: Beast's tcp_stream::expires_after() only works with ASYNC
 // operations (and setsockopt(SO_RCVTIMEO) does not work with Asio's blocking calls --
 // Asio just waits again forever). So we use the async calls and run the io_context
@@ -285,9 +268,8 @@ http::response<http::string_body> fetch(const Url& u) {
 	return parser.release();
 }
 
-// ===========================================================================
 // 4. Finding the links in the HTML
-// ===========================================================================
+
 // Uses readlib's readline(stream, '<') to split the page into chunks, one per tag.
 // Each chunk is everything AFTER a '<' up to the next '<', e.g.:
 //     a href="/about">About us
@@ -344,9 +326,9 @@ vector<string> extract_links(const string& html, const Url& base) {
 
 } // namespace
 
-// ===========================================================================
+
 // 5. The public function
-// ===========================================================================
+
 vector<string> get_links(const string& start_url) {
 	string url = start_url;
 	try {
