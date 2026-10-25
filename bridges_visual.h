@@ -8,15 +8,20 @@
 #include "GraphAdjList.h"
 using namespace std;
 #if __has_include("bridges_login.h")
+#include "bridges_login.h"
 #endif
+
 inline const char* bridges_user() {
 #ifdef BRIDGES_USER_NAME
+	return BRIDGES_USER_NAME;
 #else
-    return std::getenv("BRIDGES_USER");
+    return getenv("BRIDGES_USER");
 #endif
 }
+
 inline const char* bridges_key() {
 #ifdef BRIDGES_API_KEY
+	return BRIDGES_API_KEY;
 #else
     return std::getenv("BRIDGES_KEY");
 #endif
@@ -30,9 +35,17 @@ inline const char* depth_color(int depth) {
 }
 
 inline bool have_bridges_login() {
-	return bridges_user() && bridges_key();           // inside have_bridges_login()
-	const char* user = bridges_user();                // inside visualize_graph()
-	const char* key = bridges_key();
+	return bridges_user() && bridges_key();
+}
+
+inline string clean_url(const string& input) {
+	string result;
+	for (char c : input) {
+		if (c != '"' && c != '\\' && c != 32) {
+			result += c;
+		}
+	}
+	return result;
 }
 
 inline bool visualize_graph(const Graph& g, const std::string& title, unsigned int assignment) {
@@ -40,14 +53,16 @@ inline bool visualize_graph(const Graph& g, const std::string& title, unsigned i
 		cerr << "Set BRIDGES_USER and BRIDGES_KEY first (see the top of bridges_visual.h)\n";
 		return false;
 	}
-	const char* user = getenv("BRIDGES_USER");
-	const char* key = getenv("BRIDGES_KEY");
+	const char* user = bridges_user();;
+	const char* key = bridges_key();
 	try {
-		bridges::Bridges viz(assignment, user, key);
+		bridges::Bridges viz(1, user, key);
 		viz.setTitle(title);
 		viz.setDescription("Web crawl: node color is the number of hops from the start page; "
 				           "thick links point back toward the start.");
 		bridges::datastructure::GraphAdjList<string, string> graph;
+		vector<string> clean_urls;
+		clean_urls.reserve(g.nodes.size());
 		for (const Node& n : g.nodes) graph.addVertex(n.url, n.url);
 		for (const Edge& e : g.edges) graph.addEdge(g.nodes[e.from].url, g.nodes[e.to].url);
 		for (const Node& n : g.nodes) {
@@ -61,7 +76,7 @@ inline bool visualize_graph(const Graph& g, const std::string& title, unsigned i
 			link->setThickness(5.0);
 			link->setColor("black");
 		}
-		graph.forceSmallVisualization(true);
+		//graph.forceSmallVisualization(true);
 		viz.setDataStructure(graph);
 		viz.visualize();
 		return true;
