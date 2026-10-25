@@ -23,7 +23,7 @@ inline const char* bridges_key() {
 }
 
 inline const char* depth_color(int depth) {
-	static const char* raindbow[] = {"red", "orange", "yellow", "green", "blue", "indigo", "violet"};
+	static const char* rainbow[] = {"red", "orange", "yellow", "green", "blue", "indigo", "violet"};
 	if (depth < 0) return "gray";
 	if (depth > 6) depth = 6;
 	return rainbow[depth];
