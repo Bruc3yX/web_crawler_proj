@@ -1,23 +1,16 @@
-// link.cc  --  Step 1 (Person 1): download a web page and return the links on it.
-//
-// PUBLIC API (declared in fetch_links.h):
-//     vector<string> get_links(const string& url);
-//   -> absolute, de-duplicated http(s) URLs found in <a href="..."> tags.
-//   -> returns an EMPTY vector on any failure (bad URL, timeout, 404, not HTML...).
-//      It never throws, so the crawler can call it blindly.
-//
-// HOW IT WORKS (top to bottom of this file)
-//   1. parse_url()     split "https://host:port/path?x" into scheme/host/port/target
-//   2. resolve()       turn any href ("/a", "../b", "//cdn.x.com/c") into an absolute URL
-//   3. fetch()         ONE HTTP(S) GET using Boost.Beast (tcp_stream / ssl_stream),
-//                      with a timeout on every network step
-//   4. extract_links() use readlib's readline(page, '<') to chop the HTML into
-//                      one chunk per tag, keep the <a ...> ones, pull out href=
-//   5. get_links()     glue: fetch -> follow redirects -> check it's HTML -> extract
-//
-// BUILD (needs: sudo apt install libboost-dev libssl-dev), read.h in same folder:
-//     g++ -std=c++17 -O2 main.cc link.cc -o crawler -lssl -lcrypto -pthread
+/*
+  Downloads one page and returns the http(s) links found in its <a href> tags
+  as full URLs, with no duplicates. If anything goes wrong (bad URL, timeout,
+  404, not HTML) it returns an empty vector, so the crawler can call it
+  without any try/catch of its own.
 
+  How it's laid out:
+    parse_url()     split a URL into scheme / host / port / path
+    resolve()       turn an href like "/a" or "../b" into a full URL
+    fetch()         one HTTP(S) GET with Boost.Beast, with timeouts
+    extract_links() use readlib's readline(page, '<') to go tag by tag
+    get_links()     fetch, follow redirects, check it's HTML, extract
+*/
 #include "fetch_links.h"
 #include "read.h"          // ShakaUVM readlib: readline(stream, delimiter)
 
@@ -38,358 +31,342 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
-
-using namespace std;          // so we can write string, vector, cerr... without std::
-
+using namespace std;
 namespace beast = boost::beast;
-namespace http  = beast::http;
-namespace net   = boost::asio;
-namespace ssl   = net::ssl;
+namespace http = beast::http;
+namespace net = boost::asio;
+namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
-
 namespace {
-
 const char* USER_AGENT = "Mozilla/5.0 (compatible; ClassProjectCrawler/1.0; student project)";
-const int MAX_REDIRECTS = 5;                         // give up after this many 3xx hops
-const size_t MAX_BODY = 8 * 1024 * 1024;        // refuse pages bigger than 8 MB
-const auto TIMEOUT = chrono::seconds(15);       // per network step (connect/handshake/send/receive)
-
-string lower(string s) {
-	transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-		return tolower(c);
+const int MAX_REDIRECTS = 5;
+const size_t MAX_BODY = 8 * 1024 * 1024;        // skip pages over 8 MB
+const auto TIMEOUT = chrono::seconds(15);
+string to_lower(string text) {
+	transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+		return tolower(ch);
 	});
-	return s;
+	return text;
 }
 
-// ===========================================================================
-// 1. URL parsing
-// ===========================================================================
-
+// ---- splitting up a URL ----
 struct Url {
-	string scheme, host, port, target;   // target = path + ?query (always starts with '/')
+	string scheme, host, port, target;   // target = path + ?query, always starts with '/'
 };
 
-// "https://Example.com:8080/a/b?x=1#frag" -> scheme=https host=example.com port=8080 target=/a/b?x=1
-bool parse_url(const string& s, Url& u) {
-	size_t p = s.find("://");
-	if (p == string::npos) return false;
-	u.scheme = lower(s.substr(0, p));
-	if (u.scheme != "http" && u.scheme != "https") return false;
-	size_t hs = p + 3;
-	size_t pe = s.find_first_of("/?#", hs);                       // end of "host[:port]"
-	string auth = s.substr(hs, pe == string::npos ? string::npos : pe - hs);
-	string rest = (pe == string::npos) ? "/" : s.substr(pe);
-	size_t h = rest.find('#');
-	if (h != string::npos) rest.erase(h);                    // fragments are never sent to servers
-	if (rest.empty() || rest[0] != '/') rest = "/" + rest;
-	size_t c = auth.rfind(':');
-	if (c != string::npos) {
-		u.host = lower(auth.substr(0, c));                        // hostnames are case-insensitive
-		u.port = auth.substr(c + 1);
+bool parse_url(const string& url_text, Url& parts) {
+	size_t scheme_end = url_text.find("://");
+	if (scheme_end == string::npos) return false;
+	parts.scheme = to_lower(url_text.substr(0, scheme_end));
+	if (parts.scheme != "http" && parts.scheme != "https") return false;
+	size_t host_start = scheme_end + 3;
+	size_t host_end = url_text.find_first_of("/?#", host_start);                       // where host[:port] ends
+	string authority = url_text.substr(host_start, host_end == string::npos ? string::npos : host_end - host_start);
+	string path_and_query = (host_end == string::npos) ? "/" : url_text.substr(host_end);
+	size_t hash_pos = path_and_query.find('#');
+	if (hash_pos != string::npos) path_and_query.erase(hash_pos);                    // the #fragment never goes to the server
+	if (path_and_query.empty() || path_and_query[0] != '/') path_and_query = "/" + path_and_query;
+	size_t colon_pos = authority.rfind(':');
+	if (colon_pos != string::npos) {
+		parts.host = to_lower(authority.substr(0, colon_pos));
+		parts.port = authority.substr(colon_pos + 1);
 	} else {
-		u.host = lower(auth);
-		u.port = (u.scheme == "https") ? "443" : "80";
+		parts.host = to_lower(authority);
+		parts.port = (parts.scheme == "https") ? "443" : "80";
 	}
-	if (u.port.empty()) u.port = (u.scheme == "https") ? "443" : "80";
-	u.target = rest;
-	return !u.host.empty();
+	if (parts.port.empty()) parts.port = (parts.scheme == "https") ? "443" : "80";
+	parts.target = path_and_query;
+	return !parts.host.empty();
 }
 
-// ===========================================================================
-// 2. Making links absolute
-// ===========================================================================
+// ---- making links absolute ----
 
-// Collapse "." and ".." segments, keeping any ?query.  "/a/b/../c" -> "/a/c"
-string remove_dots(const string& in) {
-	size_t q = in.find('?');
-	string path = in.substr(0, q);
-	string query = (q == string::npos) ? "" : in.substr(q);
-	bool trailing = !path.empty() && path.back() == '/';
-	vector<string> out;
-	stringstream ss(path);
-	string seg;
-	while (getline(ss, seg, '/')) {
-		if (seg.empty() || seg == ".") continue;
-		if (seg == "..") {
-			if (!out.empty()) out.pop_back();
-		} else out.push_back(seg);
+// Handles "." and ".." in a path, keeps the ?query as is.
+string remove_dots(const string& input) {
+	size_t query_start = input.find('?');
+	string path = input.substr(0, query_start);
+	string query = (query_start == string::npos) ? "" : input.substr(query_start);
+	bool ends_with_slash = !path.empty() && path.back() == '/';
+	vector<string> segments;
+	stringstream path_stream(path);
+	string segment;
+	while (getline(path_stream, segment, '/')) {
+		if (segment.empty() || segment == ".") continue;
+		if (segment == "..") {
+			if (!segments.empty()) segments.pop_back();
+		} else segments.push_back(segment);
 	}
-	string r = "/";
-	for (size_t i = 0; i < out.size(); i++) {
-		r += out[i];
-		if (i + 1 < out.size()) r += "/";
+	string result = "/";
+	for (size_t i = 0; i < segments.size(); i++) {
+		result += segments[i];
+		if (i + 1 < segments.size()) result += "/";
 	}
-	if (trailing && !out.empty()) r += "/";
-	return r + query;
+	if (ends_with_slash && !segments.empty()) result += "/";
+	return result + query;
 }
 
-void replace_all(string& s, const string& from, const string& to) {
-	for (size_t p = 0; (p = s.find(from, p)) != string::npos; p += to.size())
-		s.replace(p, from.size(), to);
+void replace_all(string& text, const string& old_text, const string& new_text) {
+	for (size_t pos = 0; (pos = text.find(old_text, pos)) != string::npos; pos += new_text.size())
+		text.replace(pos, old_text.size(), new_text);
 }
 
-// True if href starts with "<scheme>:" (e.g. mailto:, ftp:, javascript:, https:).
-// A scheme is a letter followed by letters/digits/+/-/. and then ':' before any '/', '?'.
+// True if href starts with a scheme like "mailto:" or "https:"
+// (letters/digits/+/-/. followed by a ':')
 bool has_scheme(const string& href) {
 	if (href.empty() || !isalpha((unsigned char)href[0])) return false;
 	for (size_t i = 1; i < href.size(); i++) {
-		unsigned char c = href[i];
-		if (c == ':') return true;
-		if (!(isalnum(c) || c == '+' || c == '-' || c == '.')) return false;
+		unsigned char ch = href[i];
+		if (ch == ':') return true;
+		if (!(isalnum(ch) || ch == '+' || ch == '-' || ch == '.')) return false;
 	}
 	return false;
 }
 
-// Turn an href found on page `base` into an absolute http(s) URL.
-// Returns "" if it isn't a web link (mailto:, javascript:, ftp:, empty, "#top", ...)
+// Turns an href found on page `base` into a full http(s) URL.
+// Returns "" for anything that isn't a web link (mailto:, javascript:, "#top", ...)
 string resolve(const Url& base, string href) {
-	replace_all(href, "&amp;", "&");                              // HTML-escaped ampersands
-	size_t a = href.find_first_not_of(" \t\r\n"), b = href.find_last_not_of(" \t\r\n");
-	if (a == string::npos) return "";
-	href = href.substr(a, b - a + 1);                             // trim whitespace
-	size_t h = href.find('#');
-	if (h != string::npos) href.erase(h);                    // drop #fragment
+	replace_all(href, "&amp;", "&");
+	size_t first_non_space = href.find_first_not_of(" \t\r\n"), last_non_space = href.find_last_not_of(" \t\r\n");
+	if (first_non_space == string::npos) return "";
+	href = href.substr(first_non_space, last_non_space - first_non_space + 1);
+	size_t hash_pos = href.find('#');
+	if (hash_pos != string::npos) href.erase(hash_pos);
 	if (href.empty()) return "";
-	replace_all(href, " ", "%20");                                // raw spaces would break the request line
+	replace_all(href, " ", "%20");                                // a raw space would break the request
 
-	if (has_scheme(href)) {                                       // absolute: only keep http / https
-		string low = lower(href);
-		if (low.rfind("http://", 0) == 0 || low.rfind("https://", 0) == 0) {
-			Url u;                                                // re-build so host/scheme are lowercase
-			if (!parse_url(href, u)) return "";
-			bool def = (u.scheme == "https" && u.port == "443") || (u.scheme == "http" && u.port == "80");
-			return u.scheme + "://" + u.host + (def ? "" : ":" + u.port) + u.target;
+	if (has_scheme(href)) {                                       // already absolute, keep only http(s)
+		string href_lower = to_lower(href);
+		if (href_lower.rfind("http://", 0) == 0 || href_lower.rfind("https://", 0) == 0) {
+			Url parsed;
+			if (!parse_url(href, parsed)) return "";
+			bool is_default_port = (parsed.scheme == "https" && parsed.port == "443") || (parsed.scheme == "http" && parsed.port == "80");
+			return parsed.scheme + "://" + parsed.host + (is_default_port ? "" : ":" + parsed.port) + parsed.target;
 		}
 		return "";                                                // mailto:, javascript:, ftp:, tel: ...
 	}
 
-	// ---- relative references: build them from the page's own address ----
+	// relative link, so build it from the address of the page it was on
 	bool default_port = (base.scheme == "https" && base.port == "443") ||
 	                    (base.scheme == "http" && base.port == "80");
 	string origin = base.scheme + "://" + base.host + (default_port ? "" : ":" + base.port);
 
-	if (href.rfind("//", 0) == 0) return base.scheme + ":" + href;       // protocol-relative
-	if (href[0] == '/') return origin + remove_dots(href);               // root-relative
+	if (href.rfind("//", 0) == 0) return base.scheme + ":" + href;       // "//cdn.site.com/x"
+	if (href[0] == '/') return origin + remove_dots(href);               // "/about"
 	string path = base.target.substr(0, base.target.find('?'));
-	if (href[0] == '?') return origin + path + href;                     // query-only
-	string dir = path.substr(0, path.rfind('/') + 1);               // folder of current page
+	if (href[0] == '?') return origin + path + href;                     // "?page=2"
+	string dir = path.substr(0, path.rfind('/') + 1);
 	return origin + remove_dots(dir + href);                             // "page2.html", "../x"
 }
 
-// ===========================================================================
-// 3. HTTP(S) download with Boost.Beast
-// ===========================================================================
-// NOTE ON TIMEOUTS: Beast's tcp_stream::expires_after() only works with ASYNC
-// operations (and setsockopt(SO_RCVTIMEO) does not work with Asio's blocking calls --
-// Asio just waits again forever). So we use the async calls and run the io_context
-// until each one finishes. run_op() hides that so the code below reads top-to-bottom.
+// About the timeouts: tcp_stream::expires_after() only works on async operations,
+// and setting SO_RCVTIMEO on the socket doesn't help with Asio's blocking calls
+// (Asio just waits again). So everything below is async, and run_op() runs the
+// io_context until the one operation finishes. That way fetch() still reads top to bottom.
 
-// Start one async operation, wait for it to finish, throw if it failed (or timed out).
+// Start one async operation, wait for it, and throw if it failed or timed out.
 template <class StartFn>
 void run_op(net::io_context& ioc, StartFn start) {
 	beast::error_code ec;
 	ioc.restart();
-	start([&ec](beast::error_code e, auto&&...) {
-		ec = e;
+	start([&ec](beast::error_code err, auto&&...) {
+		ec = err;
 	});
 	ioc.run();
 	if (ec) throw beast::system_error(ec);
 }
 
-// One shared TLS context (loading the system CA list is slow, so do it only once)
+// Only build the TLS context once, loading the system certificates is slow.
 ssl::context& tls_context() {
 	static ssl::context ctx = [] {
-		ssl::context c(ssl::context::tls_client);
-		c.set_default_verify_paths();                 // trust the OS certificate store
-		c.set_verify_mode(ssl::verify_peer);          // reject bad/expired/self-signed certs
-		return c;
+		ssl::context new_ctx(ssl::context::tls_client);
+		new_ctx.set_default_verify_paths();                 // use the OS certificate store
+		new_ctx.set_verify_mode(ssl::verify_peer);          // reject bad certificates
+		return new_ctx;
 	}();
 	return ctx;
 }
 
-// Send the request and read the full response. Works for plain and TLS streams.
+// Send the request and read the whole response. Works for both plain and TLS streams.
 template <class Stream>
-void send_and_receive(net::io_context& ioc, Stream& s, http::request<http::empty_body>& req,
+void send_and_receive(net::io_context& ioc, Stream& stream, http::request<http::empty_body>& req,
               http::response_parser<http::string_body>& parser) {
 	beast::flat_buffer buf;
-	auto& low = beast::get_lowest_layer(s);
+	auto& socket_layer = beast::get_lowest_layer(stream);
 
-	low.expires_after(TIMEOUT);
-	run_op(ioc, [&](auto h) {
-		http::async_write(s, req, h);
+	socket_layer.expires_after(TIMEOUT);
+	run_op(ioc, [&](auto handler) {
+		http::async_write(stream, req, handler);
 	});
 
-	low.expires_after(TIMEOUT);                      // covers receiving the whole page
-	beast::error_code rec;
+	socket_layer.expires_after(TIMEOUT);                      // this one covers reading the whole page
+	beast::error_code read_error;
 	ioc.restart();
-	http::async_read(s, buf, parser, [&](beast::error_code e, size_t) {
-		rec = e;
+	http::async_read(stream, buf, parser, [&](beast::error_code err, size_t) {
+		read_error = err;
 	});
 	ioc.run();
-	// Servers that send "Connection: close" without a Content-Length mark the end of the
-	// page by closing the socket. Over TLS that shows up as "stream truncated" even though
-	// we got everything, so tell the parser "that's the end" and accept it if it's complete.
-	if (rec == net::ssl::error::stream_truncated) {
-		beast::error_code e2;
-		parser.put_eof(e2);
-		rec = e2;
+	// Some servers have no Content-Length and just close the socket when the page is done.
+	// Over TLS that comes back as "stream truncated" even though we have the whole page,
+	// so tell the parser we hit the end and only keep the error if the page is incomplete.
+	if (read_error == net::ssl::error::stream_truncated) {
+		beast::error_code eof_error;
+		parser.put_eof(eof_error);
+		read_error = eof_error;
 	}
-	if (rec) throw beast::system_error(rec);
+	if (read_error) throw beast::system_error(read_error);
 }
 
-// One HTTP(S) GET, NO redirect handling (get_links does that). Throws on network errors.
-http::response<http::string_body> fetch(const Url& u) {
+// One GET request. Doesn't follow redirects (get_links does that). Throws if the network fails.
+http::response<http::string_body> fetch(const Url& url) {
 	net::io_context ioc;
 	tcp::resolver resolver(ioc);
-	auto const results = resolver.resolve(u.host, u.port);   // DNS (uses the OS resolver's own timeout)
+	auto const results = resolver.resolve(url.host, url.port);   // DNS lookup, no timeout of our own here
 
-	http::request<http::empty_body> req{http::verb::get, u.target, 11};
-	req.set(http::field::host, u.host);
+	http::request<http::empty_body> req{http::verb::get, url.target, 11};
+	req.set(http::field::host, url.host);
 	req.set(http::field::user_agent, USER_AGENT);
 	req.set(http::field::accept, "text/html");
-	req.set(http::field::connection, "close");       // one request per connection: simple and safe
-	// (we don't send Accept-Encoding, so servers reply uncompressed and we can parse the text)
+	req.set(http::field::connection, "close");       // one request per connection, keeps it simple
+	// no Accept-Encoding header, so the server sends plain uncompressed text
 
 	http::response_parser<http::string_body> parser;
 	parser.body_limit(MAX_BODY);
 
-	if (u.scheme == "https") {
+	if (url.scheme == "https") {
 		beast::ssl_stream<beast::tcp_stream> stream(ioc, tls_context());
-		// SNI: tell the server which hostname we want (needed by most modern hosts)
-		if (!SSL_set_tlsext_host_name(stream.native_handle(), u.host.c_str()))
+		// SNI, tells the server which hostname we want (most sites need this)
+		if (!SSL_set_tlsext_host_name(stream.native_handle(), url.host.c_str()))
 			throw beast::system_error(beast::error_code(static_cast<int>(::ERR_get_error()),
 			                          net::error::get_ssl_category()));
-		// make sure the certificate really belongs to this host
-		stream.set_verify_callback(ssl::host_name_verification(u.host));
+		// check the certificate is really for this host
+		stream.set_verify_callback(ssl::host_name_verification(url.host));
 
-		auto& low = beast::get_lowest_layer(stream);
-		low.expires_after(TIMEOUT);
-		run_op(ioc, [&](auto h) {
-			low.async_connect(results, h);
+		auto& socket_layer = beast::get_lowest_layer(stream);
+		socket_layer.expires_after(TIMEOUT);
+		run_op(ioc, [&](auto handler) {
+			socket_layer.async_connect(results, handler);
 		});
-		low.expires_after(TIMEOUT);
-		run_op(ioc, [&](auto h) {
-			stream.async_handshake(ssl::stream_base::client, h);
+		socket_layer.expires_after(TIMEOUT);
+		run_op(ioc, [&](auto handler) {
+			stream.async_handshake(ssl::stream_base::client, handler);
 		});
 		send_and_receive(ioc, stream, req, parser);
-		// No graceful TLS shutdown: a blocking shutdown can hang on a bad server,
-		// and since we are done with this connection, just closing the socket is fine.
+		// no TLS shutdown on purpose, the blocking version can hang on a bad server
+		// and we're finished with the connection anyway
 	} else {
 		beast::tcp_stream stream(ioc);
 		stream.expires_after(TIMEOUT);
-		run_op(ioc, [&](auto h) {
-			stream.async_connect(results, h);
+		run_op(ioc, [&](auto handler) {
+			stream.async_connect(results, handler);
 		});
 		send_and_receive(ioc, stream, req, parser);
 	}
 	return parser.release();
 }
 
-// ===========================================================================
-// 4. Finding the links in the HTML
-// ===========================================================================
-// Uses readlib's readline(stream, '<') to split the page into chunks, one per tag.
-// Each chunk is everything AFTER a '<' up to the next '<', e.g.:
-//     a href="/about">About us
-// We keep chunks that start with "a" + whitespace (i.e. <a ...>), cut at the first '>'
-// to get just the attributes, and then look for  href = "value"  inside.
+// ---- finding the links in the HTML ----
+
+// readline(page, '<') gives back everything after one '<' up to the next '<',
+// so each call is one tag, like:   a href="/about">About us
+// We keep the ones that start with "a" and a space (<a ...>), cut it off at the
+// first '>' to get just the attributes, then look for href="..." in there.
 vector<string> extract_links(const string& html, const Url& base) {
 	istringstream page(html);
-	vector<string> out;
-	unordered_set<string> seen;                          // for de-duplication
+	vector<string> found;
+	unordered_set<string> seen;
 
 	while (true) {
 		string chunk = readline(page, '<');
-		if (page.fail()) break;                                    // out of input
+		if (page.fail()) break;
 		if (chunk.size() < 2 || tolower((unsigned char)chunk[0]) != 'a' ||
 		        !isspace((unsigned char)chunk[1])) continue;      // not an <a ...> tag
 
-		string tag = chunk.substr(0, chunk.find('>'));        // just the tag's attributes
-		string low = lower(tag);
+		string tag = chunk.substr(0, chunk.find('>'));
+		string tag_lower = to_lower(tag);
 
-		size_t h = 0;
-		while ((h = low.find("href", h)) != string::npos) {
-			// must be a whole attribute name ("href", not "data-href")
-			if (h == 0 || !isspace((unsigned char)low[h - 1])) {
-				h += 4;
+		size_t href_pos = 0;
+		while ((href_pos = tag_lower.find("href", href_pos)) != string::npos) {
+			// has to be the attribute "href" itself, not something like "data-href"
+			if (href_pos == 0 || !isspace((unsigned char)tag_lower[href_pos - 1])) {
+				href_pos += 4;
 				continue;
 			}
-			size_t i = h + 4;
-			while (i < tag.size() && isspace((unsigned char)tag[i])) ++i;
-			if (i >= tag.size() || tag[i] != '=') {
-				h += 4;
+			size_t cursor = href_pos + 4;
+			while (cursor < tag.size() && isspace((unsigned char)tag[cursor])) ++cursor;
+			if (cursor >= tag.size() || tag[cursor] != '=') {
+				href_pos += 4;
 				continue;
 			}
-			++i;
-			while (i < tag.size() && isspace((unsigned char)tag[i])) ++i;
-			if (i >= tag.size()) break;
+			++cursor;
+			while (cursor < tag.size() && isspace((unsigned char)tag[cursor])) ++cursor;
+			if (cursor >= tag.size()) break;
 
 			string val;
-			if (tag[i] == '"' || tag[i] == '\'') {                 // href="..." or href='...'
-				size_t e = tag.find(tag[i], i + 1);
-				if (e == string::npos) break;
-				val = tag.substr(i + 1, e - i - 1);
+			if (tag[cursor] == '"' || tag[cursor] == '\'') {                 // href="..." or href='...'
+				size_t end_pos = tag.find(tag[cursor], cursor + 1);
+				if (end_pos == string::npos) break;
+				val = tag.substr(cursor + 1, end_pos - cursor - 1);
 			} else {                                               // href=unquoted
-				size_t e = i;
-				while (e < tag.size() && !isspace((unsigned char)tag[e])) ++e;
-				val = tag.substr(i, e - i);
+				size_t end_pos = cursor;
+				while (end_pos < tag.size() && !isspace((unsigned char)tag[end_pos])) ++end_pos;
+				val = tag.substr(cursor, end_pos - cursor);
 			}
 			string absolute = resolve(base, val);
-			if (!absolute.empty() && seen.insert(absolute).second) out.push_back(absolute);
-			break;                                                 // one href per tag
+			if (!absolute.empty() && seen.insert(absolute).second) found.push_back(absolute);
+			break;
 		}
 	}
-	return out;
+	return found;
 }
 
 } // namespace
 
-// ===========================================================================
-// 5. The public function
-// ===========================================================================
+
+// ---- the function everyone else calls ----
+
 vector<string> get_links(const string& start_url) {
 	string url = start_url;
 	try {
 		for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
-			Url u;
-			if (!parse_url(url, u)) {
+			Url parts;
+			if (!parse_url(url, parts)) {
 				cerr << "[get_links] not a valid http(s) URL: " << url << "\n";
 				return {};
 			}
-			auto res = fetch(u);
-			unsigned code = res.result_int();
+			auto response = fetch(parts);
+			unsigned status = response.result_int();
 
-			if (code >= 300 && code < 400) {                 // 301/302/307/308...: go where Location says
-				auto it = res.find(http::field::location);
-				if (it == res.end()) {
-					cerr << "[get_links] HTTP " << code << " redirect with no Location: " << url << "\n";
+			if (status >= 300 && status < 400) {                 // redirect, go to the Location header
+				auto location_it = response.find(http::field::location);
+				if (location_it == response.end()) {
+					cerr << "[get_links] HTTP " << status << " redirect with no Location: " << url << "\n";
 					return {};
 				}
-				url = resolve(u, string(it->value()));  // Location may be relative
+				url = resolve(parts, string(location_it->value()));  // Location can be relative too
 				if (url.empty()) {
-					cerr << "[get_links] unusable redirect target from HTTP " << code << "\n";
+					cerr << "[get_links] unusable redirect target from HTTP " << status << "\n";
 					return {};
 				}
-				continue;                                    // loop again with the new URL
+				continue;
 			}
-			if (code != 200) {
-				cerr << "[get_links] HTTP " << code << " for " << url << "\n";
+			if (status != 200) {
+				cerr << "[get_links] HTTP " << status << " for " << url << "\n";
 				return {};
 			}
-			auto ct = res.find(http::field::content_type);
-			if (ct != res.end() && lower(string(ct->value())).find("html") == string::npos) {
-				cerr << "[get_links] skipping non-HTML (" << string(ct->value()) << "): " << url << "\n";
-				return {};                                   // not a web page (pdf, image, ...)
+			auto type_header = response.find(http::field::content_type);
+			if (type_header != response.end() && to_lower(string(type_header->value())).find("html") == string::npos) {
+				cerr << "[get_links] skipping non-HTML (" << string(type_header->value()) << "): " << url << "\n";
+				return {};                                   // pdf, image, etc.
 			}
-			auto links = extract_links(res.body(), u);       // u = FINAL url, so relative links resolve right
+			auto links = extract_links(response.body(), parts);       // u is the final URL after redirects, so relative links resolve right
 			if (links.empty())
-				cerr << "[get_links] HTTP 200 but no links found (" << res.body().size()
+				cerr << "[get_links] HTTP 200 but no links found (" << response.body().size()
 				     << " bytes) at " << url << "\n";
 			return links;
 		}
 		cerr << "[get_links] too many redirects: " << start_url << "\n";
-	} catch (const exception& e) {
-		cerr << "[get_links] " << start_url << ": " << e.what() << "\n";
+	} catch (const exception& error) {
+		cerr << "[get_links] " << start_url << ": " << error.what() << "\n";
 	}
 	return {};
 }
