@@ -6,9 +6,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>   // usleep
+#include "fetch_links.h"
 
 // ---- Person 1's function (match the name/signature they actually write) ----
-std::vector<std::string> get_links(const std::string& url);
+
 
 // ---- Data handed to Person 3 (BRIDGES) ----
 struct Edge {
@@ -61,9 +62,11 @@ private:
     size_t maxNodes;
     useconds_t delayUs;
     std::unordered_set<long long> seenEdges;
+    std::unordered_map<int, std::vector<std::string>> linkCache;   // node id -> links found on it
 
     void Reset(Graph& g, const std::string& start) {
         seenEdges.clear();
+        linkCache.clear();
         std::string s = Normalize(start);
         g.nodes.push_back({s, 0, false});
         g.id[s] = 0;
@@ -72,36 +75,41 @@ private:
     void Visit(Graph& g, int u) {   // recursion depth <= maxDepth, so this is safe
         if (g.nodes[u].depth >= maxDepth) return;
         for (const auto& link : Fetch(g, u)) {
-            size_t before = g.nodes.size();
-            int v = Link(g, u, link);
-            if (v < 0) continue;
-            if (g.nodes.size() > before || !g.nodes[v].fetched) {
-                if (!g.nodes[v].fetched) Visit(g, v);
+          bool better = false;
+            int v = Link(g, u, link, &better);
+            if (v >= 0 && better)Visit(g, v);
             }
         }
-    }
 
-    std::vector<std::string> Fetch(Graph& g, int u) {
+  std::vector<std::string> Fetch(Graph& g, int u) {
+        auto it = linkCache.find(u);
+        if (it != linkCache.end()) return it->second;   // already downloaded
         g.nodes[u].fetched = true;
-        usleep(delayUs);                       // be nice to the server
-        return get_links(g.nodes[u].url);
+        usleep(delayUs);                                // be nice to the server
+        return linkCache[u] = get_links(g.nodes[u].url);
     }
 
     // Add edge u->link (creating the node if allowed). Returns node index or -1.
-    int Link(Graph& g, int u, const std::string& raw) {
+   int Link(Graph& g, int u, const std::string& raw, bool* better = nullptr) {
         std::string url = Normalize(raw);
         if (url.empty()) return -1;
         int v;
+        bool improved = false;
         auto it = g.id.find(url);
-        if (it != g.id.end()) v = it->second;
-        else {
+        if (it != g.id.end()) {
+            v = it->second;
+            int d = g.nodes[u].depth + 1;
+            if (d < g.nodes[v].depth) { g.nodes[v].depth = d; improved = true; }
+        } else {
             if (g.nodes.size() >= maxNodes) return -1;       // graph size cap
             v = (int)g.nodes.size();
             g.nodes.push_back({url, g.nodes[u].depth + 1, false});
             g.id[url] = v;
+            improved = true;
         }
         long long key = (long long)u * 1000003LL + v;
         if (seenEdges.insert(key).second) g.edges.push_back({u, v, false});
+        if (better) *better = improved;
         return v;
     }
 
@@ -119,7 +127,7 @@ private:
         for (size_t i = 0; i < g.nodes.size(); i++) g.nodes[i].depth = dist[i];
         for (auto& e : g.edges) e.back = g.nodes[e.to].depth <= g.nodes[e.from].depth;
     }
-
+ 
     static std::string Normalize(std::string u) {
         auto h = u.find('#');                       // drop fragment
         if (h != std::string::npos) u.erase(h);
